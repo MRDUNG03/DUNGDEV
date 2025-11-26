@@ -1,0 +1,313 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_MLX90614.h>
+#include "INA226.h"
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+#include <driver/timer.h>
+
+// ===== CẤU HÌNH CHO FFT VÀ BLOCK GỬI =====
+#define SAMPLE_FREQUENCY_HZ 2000                         // Tần số lấy mẫu 2 kHz (theo bài báo)
+#define SAMPLE_PERIOD_US (1000000 / SAMPLE_FREQUENCY_HZ) // 500 us
+#define BUFFER_SIZE 2000                                 // CHÍNH XÁC 1 GIÂY dữ liệu (2000 mẫu)
+
+// ===== CẤU HÌNH CẢM BIẾN ADXL335 VÀ ACS712 (ANALOG) =====
+// ADXL335 (Analog Output)
+const int ADXL_X_PIN = 36; // ADC1 (GPIO 36)
+const int ADXL_Y_PIN = 39; // ADC1 (GPIO 39)
+const int ADXL_Z_PIN = 34; // ADC1 (GPIO 34)
+
+// ACS712 (Analog Output)
+#define ACS_PIN 35 // ADC1 (GPIO 35)
+const float V_ZERO = 2.640f;
+const float SENSITIVITY = 0.215f;
+
+// ===== CÁC CẢM BIẾN I2C VÀ WIFI/MQTT/TIME (TỐC ĐỘ THẤP) =====
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+INA226 INA(0x44);
+
+// Cấu hình mạng
+const char *ssid = "Villa_3lau";
+const char *password = "23456778";
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
+const char *mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char *mqtt_topic = "databasevidung";
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ===== CẤU TRÚC DỮ LIỆU =====
+// Dữ liệu Tốc độ cao (lấy mẫu 2kHz)
+struct FastSample
+{
+  uint16_t x_raw;       // ADXL335 X raw ADC
+  uint16_t y_raw;       // ADXL335 Y raw ADC
+  uint16_t z_raw;       // ADXL335 Z raw ADC
+  uint16_t current_raw; // ACS712 raw ADC
+};
+
+// Dữ liệu Tốc độ thấp (I2C - 2Hz)
+struct SlowData
+{
+  String timestamp;
+  float temperature;
+  float voltage;
+  float current_avg;
+};
+SlowData latestSlowData;
+
+// --- Biến Buffer và Timer ---
+FastSample data_buffer[BUFFER_SIZE];
+volatile int buffer_index = 0;
+volatile bool buffer_ready = false;
+hw_timer_t *timer = NULL;
+
+unsigned long lastMQTT = 0;
+#define SLOW_READ_INTERVAL 500 // Đọc I2C và cập nhật dữ liệu chậm mỗi 500ms (2 Hz)
+//============================================================
+// KHỞI TẠO CẢM BIẾN
+//============================================================
+void Init_Sensors()
+{
+  if (!mlx.begin())
+  {
+    Serial.println("ERR: MLX90614");
+    while (1)
+      ;
+  }
+  if (!INA.begin())
+  {
+    Serial.println("ERR: INA226");
+    while (1)
+      ;
+  }
+  INA.setMaxCurrentShunt(3.0);
+}
+
+//============================================================
+// KẾT NỐI WIFI
+//============================================================
+void Connect_WiFi()
+{
+  Serial.print("Connecting WiFi");
+  WiFi.begin(ssid, password);
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 40)
+  {
+    delay(300);
+    Serial.print(".");
+    retry++;
+  }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+  else
+    Serial.println("\nWiFi FAILED! Retrying...");
+}
+
+//============================================================
+// MQTT RECONNECT
+//============================================================
+void reconnectMQTT()
+{
+  while (!client.connected())
+  {
+    Serial.print("MQTT connecting...");
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str()))
+    {
+      Serial.println("OK");
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
+
+//============================================================
+// LẤY THỜI GIAN
+//============================================================
+String getCurrentTime()
+{
+  timeClient.update();
+  time_t epoch = timeClient.getEpochTime();
+  struct tm *ti = localtime(&epoch);
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ti);
+  return String(buf);
+}
+// Hàm này được gọi chính xác mỗi 500 us (2 kHz)
+void IRAM_ATTR onTimer()
+{
+  if (buffer_index < BUFFER_SIZE)
+  {
+    // Đọc 4 kênh ADC: ADXL335 (3 trục) và ACS712 (1 trục)
+    data_buffer[buffer_index].x_raw = analogRead(ADXL_X_PIN);
+    data_buffer[buffer_index].y_raw = analogRead(ADXL_Y_PIN);
+    data_buffer[buffer_index].z_raw = analogRead(ADXL_Z_PIN);
+    data_buffer[buffer_index].current_raw = analogRead(ACS_PIN);
+
+    buffer_index++;
+
+    if (buffer_index >= BUFFER_SIZE)
+    {
+      buffer_ready = true; // Báo hiệu Buffer đã đầy (Đủ 1 giây dữ liệu)
+    }
+  }
+}
+void Read_Slow_Sensors()
+{
+  // 1. Lấy Thời gian
+  latestSlowData.timestamp = getCurrentTime();
+
+  // 2. MLX90614
+  latestSlowData.temperature = mlx.readObjectTempC();
+  if (isnan(latestSlowData.temperature))
+    latestSlowData.temperature = -999.0f;
+
+  // 3. INA226 - Điện áp
+  float v = INA.getBusVoltage();
+  if (v < 0.25f)
+    v = 0.0f;
+  latestSlowData.voltage = v;
+
+  // 4. Tính trung bình Dòng điện ACS712
+  long sum_current = 0;
+  // Lấy 100 mẫu ngẫu nhiên từ buffer để tính trung bình
+  for (int i = 0; i < 100; i++)
+  {
+    sum_current += data_buffer[random(BUFFER_SIZE)].current_raw;
+  }
+  float raw_avg = sum_current / 100.0f;
+  float voltage_avg = raw_avg * (3.3f / 4095.0f);
+  float current_val = (voltage_avg - V_ZERO) / SENSITIVITY;
+
+  if (current_val < 0.070f)
+    current_val = 0.000f;
+  if (current_val < 0)
+    current_val = 0;
+  latestSlowData.current_avg = current_val;
+
+  Serial.printf("SLOW DATA (2Hz): V=%.3fV | I_Avg=%.3fA | T=%.2f°C\n",
+                latestSlowData.voltage, latestSlowData.current_avg, latestSlowData.temperature);
+}
+void Send_To_MQTT()
+{
+  if (!client.connected())
+    reconnectMQTT();
+
+  // Tắt Ngắt trong khi xử lý và gửi MQTT
+  timerAlarmDisable(timer);
+
+  // Kích thước tài liệu JSON: 2000 mẫu * 4 giá trị + SlowData
+  const size_t capacity = JSON_ARRAY_SIZE(BUFFER_SIZE) + BUFFER_SIZE * JSON_OBJECT_SIZE(4) + JSON_OBJECT_SIZE(5);
+  DynamicJsonDocument doc(capacity);
+
+  // 1. Dữ liệu Tốc độ Thấp (SlowData)
+  doc["timestamp"] = latestSlowData.timestamp;
+  doc["temp"] = roundf(latestSlowData.temperature * 100) / 100.0f;
+  doc["voltage"] = roundf(latestSlowData.voltage * 1000) / 1000.0f;
+  doc["current_avg"] = roundf(latestSlowData.current_avg * 1000) / 1000.0f;
+
+  // 2. Dữ liệu Tốc độ Cao (FastData) - Dữ liệu cốt lõi cho phân tích FFT
+  JsonArray fast_data = doc.createNestedArray("fast_data");
+
+  for (int i = 0; i < BUFFER_SIZE; i++)
+  {
+    JsonObject obj = fast_data.add<JsonObject>();
+    // Gửi ADC thô (ADXL335) cho Backend phân tích FFT/STFT
+    obj["ax"] = data_buffer[i].x_raw;
+    obj["ay"] = data_buffer[i].y_raw;
+    obj["az"] = data_buffer[i].z_raw;
+    obj["i_raw"] = data_buffer[i].current_raw;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  client.publish(mqtt_topic, payload.c_str());
+
+  Serial.printf("MQTT >> Gửi Khối 1 GIÂY (2000 mẫu) và Dữ liệu I2C. Payload size: %d bytes\n", payload.length());
+
+  // Reset Buffer và Bật lại Ngắt
+  buffer_index = 0;
+  buffer_ready = false;
+  timerAlarmEnable(timer);
+}
+//============================================================
+// SETUP
+//============================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+  Serial.println(F("\n=== ESP32: 2 KHZ VỚI ADXL335 (ANALOG) VÀ TOÀN BỘ CẢM BIẾN ==="));
+
+  Wire.begin(19, 22);
+  analogReadResolution(12);
+  // Thiết lập Attenuation cho tất cả các chân ADC1 được sử dụng
+  analogSetPinAttenuation(ACS_PIN, ADC_11db);
+  analogSetPinAttenuation(ADXL_X_PIN, ADC_11db);
+  analogSetPinAttenuation(ADXL_Y_PIN, ADC_11db);
+  analogSetPinAttenuation(ADXL_Z_PIN, ADC_11db);
+
+  Init_Sensors();
+  Connect_WiFi();
+
+  timeClient.begin();
+  client.setServer(mqtt_server, mqtt_port);
+
+  // Cấu hình Timer cho 2 kHz (500 us)
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &onTimer, true);
+  timerAlarmWrite(timer, SAMPLE_PERIOD_US, true);
+  timerAlarmEnable(timer);
+
+  delay(2000);
+  Serial.println(F("Bắt đầu lấy mẫu 4 kênh Analog ở 2 kHz và gửi MQTT..."));
+}
+
+//============================================================
+// LOOP CHÍNH
+//============================================================
+void loop()
+{
+  unsigned long current_time = millis();
+
+  // 1. Đọc I2C và cập nhật dữ liệu chậm (SlowData) mỗi 500ms
+  if (current_time - lastMQTT >= SLOW_READ_INTERVAL)
+  {
+    lastMQTT = current_time;
+    Read_Slow_Sensors();
+  }
+
+  // 2. Gửi MQTT nếu Buffer đầy (Đủ 1 giây)
+  if (buffer_ready)
+  {
+    if (WiFi.isConnected())
+    {
+      Send_To_MQTT();
+    }
+    else
+    {
+      Serial.println("WiFi bị ngắt kết nối.");
+    }
+  }
+
+  client.loop();
+
+// Tự reconnect WiFi nếu mất
+      if (WiFi.status() != WL_CONNECTED)
+  {
+    delay(1000);
+    Connect_WiFi();
+  }
+  // Cho phép các tác vụ nền (như WiFi) chạy
+  delay(1);
+}

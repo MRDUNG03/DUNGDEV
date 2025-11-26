@@ -1,0 +1,263 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_MLX90614.h>
+#include "INA226.h"
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+#include <Base64.h> // Thư viện Base64 Encoder
+
+// ==========================================================
+// CẤU HÌNH THÔNG SỐ & I2C
+// ==========================================================
+#define SAMPLE_RATE_HZ 1000       // Giả định Fs tối đa 1 kHz (1ms/mẫu)
+#define SAMPLES 1024                // Số lượng mẫu (2^10) cho FFT
+#define I2C_SPEED_HZ 400000         // Tăng tốc độ I2C lên 400 kHz (Fast Mode)
+
+// Cấu hình PIN và ADC
+#define ADXL_I2C_ADDR 0x53          // Địa chỉ mặc định của ADXL345
+#define ADXL_DATA_START 0x32        // Thanh ghi dữ liệu X-Axis
+#define ACS_PIN 35                  // Chân ADC cho ACS712
+#define ADC_MAX_VOLTAGE 3.3f
+#define ADC_MAX_VALUE 4095.0f
+
+// Kích thước gói tin raw data (1024 mẫu * 4 byte/float * 2 kênh)
+#define RAW_DATA_SIZE (SAMPLES * sizeof(float) * 2) 
+const size_t RAW_BUFFER_SIZE_BYTES = RAW_DATA_SIZE;
+
+// ==========================================================
+// KHAI BÁO BIẾN TOÀN CỤC & SEMAPHORE (SHARED RESOURCES)
+// ==========================================================
+
+// Double Buffer cho Rung động và Dòng điện
+float buffer_vib_x[2][SAMPLES];
+float buffer_current[2][SAMPLES];
+
+// Metadata cho từng gói
+String buffer_timestamp[2];
+float buffer_temp[2];
+float buffer_power[2];
+
+// Semaphore và biến kiểm soát Task
+SemaphoreHandle_t buffer_mutex;           // Bảo vệ Buffer
+SemaphoreHandle_t buffer_ready_semaphore; // Báo hiệu Buffer đầy
+
+volatile int current_buffer = 0;
+volatile int sample_count = 0;
+
+// ==========================================================
+// KHAI BÁO CẢM BIẾN & WIFI
+// ==========================================================
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+INA226 INA(0x44);
+
+const char *ssid = "Villa_3lau";
+const char *password = "23456778";
+const char *mqtt_server = "broker.hivemq.com";
+const char *mqtt_topic = "databasevidung";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
+
+
+// ==========================================================
+// HÀM HỖ TRỢ
+// ==========================================================
+
+// Hàm lấy thời gian (Chạy trên Core 1)
+String getCurrentTime() {
+    timeClient.update();
+    time_t epoch = timeClient.getEpochTime();
+    struct tm *ti = localtime(&epoch);
+    char buf[25];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", ti);
+    return String(buf);
+}
+
+// Hàm kết nối/reconnect
+void Connect_WiFi() {
+    if (WiFi.status() != WL_CONNECTED) {
+        // ... (Logic kết nối WiFi) ...
+    }
+}
+void reconnectMQTT() {
+    // ... (Logic reconnect MQTT) ...
+}
+
+// Hàm đọc 1 trục ADXL345 (I2C tốc độ cao)
+void readADXL345_I2C(float &x) {
+    Wire.beginTransmission(ADXL_I2C_ADDR);
+    Wire.write(ADXL_DATA_START); 
+    Wire.endTransmission(false); // Giữ kết nối
+    
+    if (Wire.requestFrom(ADXL_I2C_ADDR, 2) == 2) {
+        int16_t x_raw = Wire.read();
+        x_raw |= (Wire.read() << 8); 
+        
+        const float scale_factor = 0.0039f; 
+        x = (float)x_raw * scale_factor;
+    } else {
+        x = 0.0f; 
+    }
+}
+
+// ==========================================================
+// CORE 0: TASK THU THẬP DỮ LIỆU 1kHz (ACQUISITION)
+// ==========================================================
+
+void TaskAcquisition(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(1); // 1ms (1000Hz)
+
+    // Cấu hình ADXL345 (Cần thêm code I2C cấu hình Data Rate 1000Hz cho thanh ghi 0x2C)
+    // Giả định đã được cấu hình trước.
+
+    for (;;) {
+        vTaskDelayUntil(&xLastWakeTime, xFrequency); // Đảm bảo chu kỳ 1ms
+
+        // 1. Đọc Rung động X và Dòng điện (VDC)
+        float x_val, vdc_val;
+        readADXL345_I2C(x_val); 
+        vdc_val = (float)analogRead(ACS_PIN) * (ADC_MAX_VOLTAGE / ADC_MAX_VALUE);
+        
+        // 2. Lưu vào Buffer (Kiểm tra và chiếm quyền Mutex)
+        if (xSemaphoreTake(buffer_mutex, 0) == pdTRUE) { 
+            
+            buffer_vib_x[current_buffer][sample_count] = x_val; 
+            buffer_current[current_buffer][sample_count] = vdc_val; 
+
+            sample_count++;
+
+            if (sample_count >= SAMPLES) {
+                // 3. Buffer đầy: Đọc Metadata và Báo hiệu
+                buffer_temp[current_buffer] = mlx.readObjectTempC(); 
+                buffer_power[current_buffer] = INA.getBusPower();
+                buffer_timestamp[current_buffer] = getCurrentTime();
+
+                xSemaphoreGive(buffer_ready_semaphore); // Báo hiệu cho TaskCommunication
+                current_buffer = 1 - current_buffer;    // Chuyển Buffer
+                sample_count = 0;
+            }
+            xSemaphoreGive(buffer_mutex);
+        }
+    }
+}
+
+// ==========================================================
+// CORE 1: TASK TRUYỀN THÔNG (COMMUNICATION)
+// ==========================================================
+
+void TaskCommunication(void *pvParameters) {
+    // Không cần vTaskDelayUntil cố định, Semaphore điều khiển tần suất gửi
+    
+    // Khai báo mảng byte tạm thời để chứa dữ liệu 2 kênh
+    byte raw_byte_array[RAW_BUFFER_SIZE_BYTES];
+
+    for (;;) {
+        // Chờ Buffer đầy (Chỉ gửi khi có đủ 1024 mẫu - khoảng 1 giây 1 lần)
+        if (xSemaphoreTake(buffer_ready_semaphore, portMAX_DELAY) == pdTRUE) { 
+
+            // 1. Đảm bảo kết nối MQTT
+            Connect_WiFi();
+            if (!client.connected()) reconnectMQTT();
+            client.loop();
+
+            // Buffer vừa được điền đầy xong 
+            int sending_buffer = 1 - current_buffer; 
+            
+            // --- ĐÓNG GÓI NHỊ PHÂN & BASE64 ---
+
+            // 2. Sao chép dữ liệu Rung động
+            memcpy(raw_byte_array, 
+                   buffer_vib_x[sending_buffer], 
+                   SAMPLES * sizeof(float));
+
+            // 3. Sao chép dữ liệu Dòng điện (nối tiếp)
+            memcpy(raw_byte_array + SAMPLES * sizeof(float), 
+                   buffer_current[sending_buffer], 
+                   SAMPLES * sizeof(float));
+
+            // 4. Mã hóa Base64
+            String base64_payload = base64::encode(raw_byte_array, RAW_BUFFER_SIZE_BYTES); 
+            
+            // 5. Tạo JSON Payload
+            JsonDocument doc;
+            doc["motor_id"] = "MTR_001";
+            doc["timestamp"] = buffer_timestamp[sending_buffer];
+            doc["sample_rate"] = SAMPLE_RATE_HZ;
+            
+            doc["raw_data_base64"] = base64_payload; 
+            
+            doc["temp_ir"] = buffer_temp[sending_buffer];
+            doc["power"] = buffer_power[sending_buffer];
+            
+            String payload_str;
+            serializeJson(doc, payload_str);
+            
+            // 6. Gửi MQTT
+            client.publish(mqtt_topic, payload_str.c_str());
+            Serial.printf("MQTT Sent: %d samples | Fs: %d Hz | Size: %d KB\n", SAMPLES, SAMPLE_RATE_HZ, payload_str.length() / 1024);
+
+        }
+    }
+}
+
+// ==========================================================
+// SETUP & LOOP ARDUINO
+// ==========================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(100);
+
+    // Khởi tạo và TĂNG TỐC ĐỘ I2C BUS (GPIO 19, 22 là chân I2C mặc định)
+    Wire.begin(19, 22, I2C_SPEED_HZ); 
+    
+    // Khởi tạo các cảm biến I2C và ADC
+    if (!mlx.begin() || !INA.begin()) { Serial.println("ERR: MLX/INA226"); while(1); }
+    INA.setMaxCurrentShunt(3.0);
+    
+    analogReadResolution(12);
+    analogSetPinAttenuation(ACS_PIN, ADC_11db);
+
+    // Khởi tạo Semaphore
+    buffer_mutex = xSemaphoreCreateMutex();
+    buffer_ready_semaphore = xSemaphoreCreateBinary();
+
+    // Khởi tạo MQTT và NTP
+    client.setServer(mqtt_server, 1883);
+    timeClient.begin();
+    
+    // 1. Task Thu thập (Chạy trên Core 0 - đảm bảo tính thời gian thực)
+    xTaskCreatePinnedToCore(
+        TaskAcquisition, 
+        "Acq_Task", 
+        10000, 
+        NULL, 
+        3, 
+        NULL, 
+        0 // PIN VÀO CORE 0
+    );
+
+    // 2. Task Truyền thông (Chạy trên Core 1 - lo mọi thứ chậm)
+    xTaskCreatePinnedToCore(
+        TaskCommunication,
+        "Comm_Task",
+        15000, // Heap lớn cho Base64/JSON
+        NULL,
+        1,
+        NULL,
+        1 // PIN VÀO CORE 1
+    );
+    
+    Serial.println("Hệ thống khởi động...");
+}
+
+void loop() {
+    // Vòng lặp chính để trống
+    delay(100);
+}

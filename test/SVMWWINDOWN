@@ -1,0 +1,83 @@
+import numpy as np
+from scipy.fft import fft
+from scipy.signal import windows
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+# --- THÔNG SỐ CỐ ĐỊNH ---
+W = 512       # Kích thước cửa sổ (mẫu/cửa sổ)
+S = 512       # Bước nhảy (Stride)
+FS = 512      # Tần số lấy mẫu (Hz)
+
+# --- BƯỚC 0: DỮ LIỆU ĐẦU VÀO (Thay thế bằng dữ liệu thực tế 600k mẫu của bạn) ---
+N_TOTAL_SAMPLES = 600000
+t = np.arange(N_TOTAL_SAMPLES) / FS
+# Tạo dữ liệu giả lập Normal (ví dụ: tín hiệu 5Hz)
+raw_data_normal = 0.5 * np.sin(2 * np.pi * 5 * t) + np.random.normal(0, 0.1, N_TOTAL_SAMPLES)
+print(f"Tổng dữ liệu Normal thô: {len(raw_data_normal)} mẫu.")
+# -------------------------------------------------------------------------
+
+# --- 2. HÀM TRÍCH XUẤT ĐẶC TRƯNG MIỀN TẦN SỐ ---
+def extract_frequency_features(window_data, W, FS):
+    """Trích xuất 5 đặc trưng miền tần số (Phải giống hệt nhau khi Training và Testing)."""
+    hanning_window = windows.hann(W)
+    windowed_signal = window_data * hanning_window
+    
+    N_FFT = len(windowed_signal)
+    Y = fft(windowed_signal)
+    P2 = np.abs(Y / N_FFT)
+    P1 = P2[:N_FFT//2]
+    P1[1:-1] = 2 * P1[1:-1]
+    f = FS * np.arange(0, N_FFT/2) / N_FFT
+
+    # Tính toán 5 Đặc trưng (Các đặc trưng năng lượng phổ biến)
+    total_energy = np.sum(P1**2) 
+    center_frequency = np.sum(f * P1) / np.sum(P1)
+    rms_frequency = np.sqrt(np.sum((f**2) * P1) / np.sum(P1))
+    
+    # Năng lượng dải tần thấp (Dưới 50Hz)
+    low_freq_indices = f <= 50
+    low_freq_energy = np.sum(P1[low_freq_indices]**2)
+    
+    # Tần số có biên độ cực đại (bỏ qua DC/0Hz)
+    peak_freq_index = np.argmax(P1[1:]) + 1
+    peak_frequency = f[peak_freq_index]
+    
+    return [total_energy, center_frequency, rms_frequency, low_freq_energy, peak_frequency]
+
+# --- 3. QUY TRÌNH TẠO MÔ HÌNH ---
+features_list = []
+current_idx = 0
+
+# 3.1. Chia cửa sổ và Trích xuất
+while current_idx + W <= len(raw_data_normal):
+    window_data = raw_data_normal[current_idx : current_idx + W]
+    feature_vector = extract_frequency_features(window_data, W, FS)
+    features_list.append(feature_vector)
+    current_idx += S
+    
+X_normal = np.array(features_list)
+print(f"Tổng số mẫu đặc trưng Normal đã tạo (X_normal): {X_normal.shape[0]}")
+# Kết quả: (1171, 5)
+
+# 3.2. Chuẩn hóa Dữ liệu (Rất quan trọng cho SVM)
+# Chúng ta FIT (học) Scaler trên dữ liệu Normal này
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_normal)
+print(f"Kích thước dữ liệu sau khi chuẩn hóa: {X_train_scaled.shape}")
+
+# 3.3. Huấn luyện One-Class SVM
+# nu: Tỷ lệ dữ liệu Normal bị coi là outliers (ví dụ: 5%)
+nu_value = 0.05 
+oc_svm = OneClassSVM(kernel='rbf', gamma='auto', nu=nu_value) 
+oc_svm.fit(X_train_scaled)
+
+print("✅ Huấn luyện mô hình One-Class SVM cho trạng thái Normal đã hoàn tất!")
+
+# 3.4. Lưu Mô hình và Scaler
+# Bạn cần lưu cả hai file này để sử dụng trong bước chẩn đoán Real-time.
+joblib.dump(oc_svm, 'ocsvm_normal_model.pkl')
+joblib.dump(scaler, 'scaler_normal.pkl')
+
+print("\n💾 Đã lưu 2 file đầu ra quan trọng: 'ocsvm_normal_model.pkl' và 'scaler_normal.pkl'")
